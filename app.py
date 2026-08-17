@@ -14,7 +14,7 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.pipeline import make_pipeline
 import joblib
 
-APP = "⚽ Football AI Coach V6"
+APP = "⚽ Football AI Coach V6.1"
 BASE = Path(".")
 STATE = BASE / "coach_state"
 STATE.mkdir(exist_ok=True)
@@ -171,21 +171,56 @@ def get_model():
     return model, joblib.load(spath), len(df), "bootstrapped"
 
 def team_lookup(df, q):
+    """Strict, alias-aware team resolver.
+
+    The old resolver treated any substring as a strong match. That made
+    ``Paris Saint-Germain`` incorrectly match ``Aris`` because ``aris`` is
+    contained inside ``paris``. V6.1 only gives a strong score to an exact
+    normalized/alias match, and uses token/edit similarity only as a fallback.
+    Short one-token candidates are never accepted merely because they are a
+    substring of a longer team name.
+    """
+    from difflib import SequenceMatcher
     qn=alias(q)
+    qtokens=set(qn.split())
     names=pd.unique(pd.concat([df.home,df.away],ignore_index=True).astype(str))
     scored=[]
-    for n in names:
+    for raw in names:
+        n=str(raw).strip()
         nn=norm(n)
-        if nn==qn: s=1.0
-        elif qn in nn or nn in qn: s=.86
+        if not nn:
+            continue
+        # Strongest possible match: normalized name or known alias.
+        if nn==qn:
+            s=1.0
         else:
-            # token overlap + edit-ish ratio
-            qt=set(qn.split()); nt=set(nn.split())
-            overlap=len(qt&nt)/max(1,len(qt|nt))
-            s=overlap
-        if s>=.45: scored.append((s,n))
-    scored.sort(reverse=True)
-    return scored[:8]
+            ntokens=set(nn.split())
+            inter=len(qtokens & ntokens)
+            union=len(qtokens | ntokens)
+            jacc=inter/max(1,union)
+            seq=SequenceMatcher(None,qn,nn).ratio()
+            # Only allow containment when it is a whole-token match and the
+            # candidate has at least two meaningful tokens.
+            token_contained = (len(ntokens)>=2 and (qn in nn or nn in qn))
+            if token_contained:
+                s=max(jacc, seq*0.96)
+            else:
+                s=max(jacc, seq*0.90)
+            # One-token names such as Aris must not score highly just because
+            # their letters occur inside a multi-token query.
+            if len(ntokens)==1 and len(qtokens)>=2 and nn not in qtokens:
+                s=min(s,0.55)
+        if s>=0.55:
+            scored.append((float(s),n))
+    # Deduplicate names by normalized spelling, keeping the strongest score.
+    best_by_norm={}
+    for s,n in scored:
+        k=norm(n)
+        if k not in best_by_norm or s>best_by_norm[k][0]:
+            best_by_norm[k]=(s,n)
+    out=list(best_by_norm.values())
+    out.sort(key=lambda x:(-x[0], x[1].lower()))
+    return out[:8]
 
 def make_feature_for_match(state,h,a):
     teams=state["teams"]; elo=state["elo"]
@@ -266,7 +301,7 @@ def exact_fixture_web(home,away,date=None):
 
 st.set_page_config(page_title=APP,page_icon="⚽",layout="wide")
 st.title(APP)
-st.caption("Pre-trained-on-first-bootstrap ML • Persistent model • Continual update ready • No football API")
+st.caption("Real ML • persistent pre-trained model • strict team resolver • continual-learning ready • no football API")
 
 with st.sidebar:
     st.header("MATCH")
@@ -285,12 +320,14 @@ try:
     with st.spinner("Loading persistent football model..."):
         model,state,nrows,mode=get_model()
     st.success(f"MODEL READY • {mode.upper()} • historical rows available: {nrows:,}")
+    st.caption("Historical rows = source dataset size. The trained model reports its actual training/test rows below.")
 except Exception as e:
     st.error("MODEL BOOTSTRAP FAILED")
     st.exception(e)
     st.stop()
 
 st.write(f"### {home}  vs  {away}")
+st.caption("Team matching uses exact normalized names and explicit aliases first; weak substring matches are rejected.")
 hcan=team_lookup(load_bootstrap(),home)
 acan=team_lookup(load_bootstrap(),away)
 if not hcan or not acan:
@@ -384,6 +421,8 @@ st.write({
     "accuracy":round(meta.get("accuracy",0),4),
     "log_loss":round(meta.get("log_loss",0),4),
     "brier":round(meta.get("brier",0),4),
+    "model_type":"HistGradientBoostingClassifier",
+    "feature_count":13,
     "persistent_model":True
 })
 st.caption("Continual-learning state is persistent. New labeled matches can be appended and the model can be incrementally updated; the app never silently retrains from scratch on every prediction.")
