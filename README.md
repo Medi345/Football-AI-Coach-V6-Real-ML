@@ -1,26 +1,24 @@
-# Football AI Coach V6.2 — Real ML
+# Football AI Coach V6.3
 
-V6.2 fixes a critical team-resolution bug from V6. The previous resolver treated any substring as a strong match, so `Paris Saint-Germain` could incorrectly match `Aris`.
+Real ML football prediction application.
 
-## What V6.2 does
-- Real `HistGradientBoostingClassifier` trained on chronological football results.
-- Bootstrap dataset: real historical match results from the documented open dataset.
-- Persistent `joblib` model and state.
-- Elo + recent form + home/away features.
-- Time-ordered train/test split; no random split.
-- Accuracy, Log Loss and multiclass Brier score.
-- Strict team resolver: exact normalized names + explicit aliases + conservative fuzzy fallback.
-- Rejects weak substring matches such as `Aris` for `Paris Saint-Germain`.
-- No football-data.org/API-Football dependency.
-- No invented fixtures or bookmaker odds.
+## What is real
+- 1.3M+ historical rows in the bootstrap source dataset.
+- Chronological, leakage-safe feature construction.
+- HistGradientBoostingClassifier.
+- Time-based train/test split.
+- Accuracy, log loss and multiclass Brier score.
+- Persisted trained model.
+- Elo/form/goal features.
+- Poisson score matrix.
+- ML + Poisson ensemble.
+- Broad model-derived markets and fair odds.
 
-## Important
-`historical rows available` is the size of the source dataset. `training_rows` and `test_rows` in Model Health are the actual rows used to fit/evaluate the ML model.
+## Important limitations
+- The bootstrap dataset contains final scores, not reliable first-half scores for every competition. FH/SH are therefore not fabricated.
+- Bookmaker odds are not invented. Without a verified odds source, bookmaker value/edge is not calculated.
+- Public-web fixture verification is only a safety check; failure to verify does not create a fake fixture.
+- V6.3 does NOT falsely claim that automatic online learning is already implemented. The persisted model can be loaded without retraining, but a production continual-learning ingestion pipeline still needs to be connected to verified new match results.
 
-The bootstrap dataset currently contains full-time results, not reliable first-half/second-half scores for every competition. Therefore FH/SH predictions are not fabricated.
-
-Continual learning requires new labeled matches to be appended to the persistent knowledge base and then applied to the saved model; the app does not silently retrain from scratch for each prediction.
-
-
-## V6.2 bug fix
-Fixed the TOP 10 SCORES crash: the previous version accidentally iterated over the market dictionary (`Home Win`, `Draw`, etc.) as if it were a score matrix. V6.2 now reads score probabilities directly from the Poisson matrix.
+## Deploy
+Replace `app.py`, `requirements.txt`, and `README.md` in the GitHub repository, commit, then reboot the Streamlit app.

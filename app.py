@@ -14,7 +14,7 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.pipeline import make_pipeline
 import joblib
 
-APP = "⚽ Football AI Coach V6.2"
+APP = "⚽ Football AI Coach V6.3"
 BASE = Path(".")
 STATE = BASE / "coach_state"
 STATE.mkdir(exist_ok=True)
@@ -257,31 +257,56 @@ def poisson_matrix(lh,la,n=8):
     return mat/mat.sum()
 
 def markets(mat):
-    n=mat.shape[0]; probs={}
-    for i in range(n):
-        for j in range(n):
-            probs[(i,j)]=mat[i,j]
-    home=sum(v for (i,j),v in probs.items() if i>j)
-    draw=sum(v for (i,j),v in probs.items() if i==j)
-    away=sum(v for (i,j),v in probs.items() if i<j)
-    total=lambda f:sum(v for (i,j),v in probs.items() if f(i+j))
-    return {
-        "Home Win":home,"Draw":draw,"Away Win":away,
-        "1X":home+draw,"X2":draw+away,"12":home+away,
-        "Over 0.5":total(lambda x:x>.5),"Over 1.5":total(lambda x:x>1.5),
-        "Over 2.5":total(lambda x:x>2.5),"Over 3.5":total(lambda x:x>3.5),
-        "Over 4.5":total(lambda x:x>4.5),
-        "Under 1.5":total(lambda x:x<1.5),"Under 2.5":total(lambda x:x<2.5),
-        "Under 3.5":total(lambda x:x<3.5),"Under 4.5":total(lambda x:x<4.5),
-        "BTTS Yes":sum(v for (i,j),v in probs.items() if i>0 and j>0),
-        "BTTS No":sum(v for (i,j),v in probs.items() if i==0 or j==0),
-        "Home Over 0.5":sum(v for (i,j),v in probs.items() if i>.5),
-        "Home Over 1.5":sum(v for (i,j),v in probs.items() if i>1.5),
-        "Home Over 2.5":sum(v for (i,j),v in probs.items() if i>2.5),
-        "Away Over 0.5":sum(v for (i,j),v in probs.items() if j>.5),
-        "Away Over 1.5":sum(v for (i,j),v in probs.items() if j>1.5),
-        "Away Over 2.5":sum(v for (i,j),v in probs.items() if j>2.5),
+    """Calculate a broad, deterministic market book from the score matrix."""
+    n = mat.shape[0]
+    entries = [(i, j, float(mat[i, j])) for i in range(n) for j in range(n)]
+
+    def prob(fn):
+        return float(sum(p for i, j, p in entries if fn(i, j)))
+
+    def total_gt(x):
+        return prob(lambda i, j: i + j > x)
+
+    def total_lt(x):
+        return prob(lambda i, j: i + j < x)
+
+    out = {
+        "Home Win": prob(lambda i,j: i > j),
+        "Draw": prob(lambda i,j: i == j),
+        "Away Win": prob(lambda i,j: i < j),
+        "1X": prob(lambda i,j: i >= j),
+        "X2": prob(lambda i,j: i <= j),
+        "12": prob(lambda i,j: i != j),
+
+        "Over 0.5": total_gt(0.5),
+        "Over 1.5": total_gt(1.5),
+        "Over 2.5": total_gt(2.5),
+        "Over 3.5": total_gt(3.5),
+        "Over 4.5": total_gt(4.5),
+
+        "Under 1.5": total_lt(1.5),
+        "Under 2.5": total_lt(2.5),
+        "Under 3.5": total_lt(3.5),
+        "Under 4.5": total_lt(4.5),
+
+        "BTTS Yes": prob(lambda i,j: i >= 1 and j >= 1),
+        "BTTS No": prob(lambda i,j: i == 0 or j == 0),
+
+        "Home Over 0.5": prob(lambda i,j: i >= 1),
+        "Home Over 1.5": prob(lambda i,j: i >= 2),
+        "Home Over 2.5": prob(lambda i,j: i >= 3),
+
+        "Away Over 0.5": prob(lambda i,j: j >= 1),
+        "Away Over 1.5": prob(lambda i,j: j >= 2),
+        "Away Over 2.5": prob(lambda i,j: j >= 3),
+
+        "Home Clean Sheet": prob(lambda i,j: j == 0),
+        "Away Clean Sheet": prob(lambda i,j: i == 0),
+        "Home Win To Nil": prob(lambda i,j: i > j and j == 0),
+        "Away Win To Nil": prob(lambda i,j: j > i and i == 0),
     }
+    # Keep numerical safety after the finite 0..8 score grid.
+    return {k: float(np.clip(v, 0.0, 1.0)) for k,v in out.items()}
 
 def exact_fixture_web(home,away,date=None):
     # No API: use public search engine HTML through a search endpoint.
@@ -376,10 +401,16 @@ p_final=p_final/p_final.sum()
 top_scores=sorted(((i,j), float(mat[i,j])) for i in range(mat.shape[0]) for j in range(mat.shape[1]))[::-1]
 best=[]
 for name,p in pm.items():
-    if p<=0: continue
-    fair=1/p
-    best.append((name,p,fair))
-best=sorted(best,key=lambda x:x[1],reverse=True)[:8]
+    p=float(p)
+    if not np.isfinite(p) or p <= 0.0:
+        continue
+    fair=1.0/p
+    # Without bookmaker odds, this is a model-probability ranking only.
+    # We penalize extremely low-probability markets rather than pretending
+    # they have positive betting value.
+    score = p * math.sqrt(max(0.0, min(1.0, p)))
+    best.append((name,p,fair,score))
+best=sorted(best,key=lambda x:x[3],reverse=True)
 
 st.header("FULL TIME")
 c1,c2,c3=st.columns(3)
@@ -387,6 +418,15 @@ c1.metric("Home",f"{p_final[0]*100:.1f}%")
 c2.metric("Draw",f"{p_final[1]*100:.1f}%")
 c3.metric("Away",f"{p_final[2]*100:.1f}%")
 st.write(f"**Expected goals:** {lh:.2f} — {la:.2f}")
+with st.expander("MODEL vs POISSON PROBABILITIES"):
+    diag = pd.DataFrame({
+        "Outcome":["Home","Draw","Away"],
+        "ML":[f"{x*100:.2f}%" for x in p_ml],
+        "Poisson":[f"{x*100:.2f}%" for x in p_po],
+        "Ensemble":[f"{x*100:.2f}%" for x in p_final],
+    })
+    st.dataframe(diag, use_container_width=True)
+
 
 st.header("TOP 10 SCORES")
 rows=[]
@@ -403,10 +443,12 @@ st.dataframe(pd.DataFrame(mr),use_container_width=True)
 st.header("BEST MODEL BETS")
 st.caption("These are model selections only. Without verified bookmaker odds there is NO real bookmaker value/edge calculation.")
 bb=[]
-for name,p,fair in best[:3]:
+for name,p,fair,score in best[:3]:
     confidence=(0.5+0.5*max(p_final))*(0.7+0.3*min(1,nrows/200000))
     bb.append({"Rank":len(bb)+1,"Market":name,"Probability":f"{p*100:.1f}%",
-               "Fair Odds":f"{fair:.2f}","Confidence":f"{confidence*100:.1f}%"})
+               "Fair Odds":f"{fair:.2f}","Bookmaker Odds":"NOT AVAILABLE",
+               "Value/Edge":"NOT CALCULABLE",
+               "Confidence":f"{confidence*100:.1f}%"})
 st.dataframe(pd.DataFrame(bb),use_container_width=True)
 
 st.header("FIRST HALF / SECOND HALF")
@@ -425,4 +467,4 @@ st.write({
     "feature_count":13,
     "persistent_model":True
 })
-st.caption("Continual-learning state is persistent. New labeled matches can be appended and the model can be incrementally updated; the app never silently retrains from scratch on every prediction.")
+st.caption("The trained model is persisted in the app filesystem and loaded on later runs while that storage remains available. V6.3 does not claim completed automatic online learning until new labeled-match ingestion is connected.")
