@@ -1,470 +1,463 @@
 
-import os, re, json, math, time, sqlite3, hashlib, unicodedata
+import os, re, math, json, time, unicodedata, hashlib
 from pathlib import Path
 from datetime import datetime, timezone
-import requests
 import numpy as np
 import pandas as pd
+import requests
 import streamlit as st
+import joblib
 from scipy.stats import poisson
 from sklearn.ensemble import HistGradientBoostingClassifier, HistGradientBoostingRegressor
+from sklearn.metrics import accuracy_score, log_loss, brier_score_loss, mean_absolute_error
 from sklearn.linear_model import SGDClassifier
-from sklearn.metrics import accuracy_score, log_loss, brier_score_loss
 from sklearn.preprocessing import StandardScaler
 from sklearn.pipeline import make_pipeline
-import joblib
 
-APP = "⚽ Football AI Coach V6.3"
-BASE = Path(".")
-STATE = BASE / "coach_state"
-STATE.mkdir(exist_ok=True)
-MODEL_DIR = STATE / "models"
+APP = "⚽ Football AI Coach V7"
+ROOT = Path(".")
+DATA_DIR = ROOT / "data_cache"
+MODEL_DIR = ROOT / "model_store"
+DATA_DIR.mkdir(exist_ok=True)
 MODEL_DIR.mkdir(exist_ok=True)
-DB_PATH = STATE / "knowledge.sqlite"
 
-# Public, non-API bootstrap dataset. It contains 1.2M+ historical matches
-# across 207 domestic top-tier leagues and 20 international tournaments
-# through 2023. The source is documented in README.md.
-BOOTSTRAP_URL = (
-    "https://raw.githubusercontent.com/schochastics/football-data/"
-    "master/data/results/games.parquet"
-)
+FIXTURES_URL = "https://huggingface.co/datasets/eatpizzanot/soccer-dataset/resolve/main/fixtures.parquet"
+STATS_URL = "https://huggingface.co/datasets/eatpizzanot/soccer-dataset/resolve/main/match_stats.parquet"
+ODDS_URL = "https://huggingface.co/datasets/eatpizzanot/soccer-dataset/resolve/main/odds.parquet"
+TEAMS_URL = "https://huggingface.co/datasets/eatpizzanot/soccer-dataset/resolve/main/teams.parquet"
+MODEL_FILE = MODEL_DIR / "v7_bundle.joblib"
+STATE_FILE = MODEL_DIR / "v7_state.json"
+DATA_FILE = DATA_DIR / "matches.parquet"
+STATS_FILE = DATA_DIR / "stats.parquet"
+ODDS_FILE = DATA_DIR / "odds.parquet"
+TEAMS_FILE = DATA_DIR / "teams.parquet"
 
 ALIASES = {
-    "psg": "Paris Saint-Germain",
-    "paris saint germain": "Paris Saint-Germain",
-    "man utd": "Manchester United",
-    "man united": "Manchester United",
-    "manchester utd": "Manchester United",
-    "inter": "Inter",
-    "internazionale": "Inter",
-    "bayern": "Bayern Munich",
-    "atletico madrid": "Atlético Madrid",
-    "atletico": "Atlético Madrid",
-    "barca": "Barcelona",
-    "fc barcelona": "Barcelona",
+    "psg":"Paris Saint-Germain", "paris saint germain":"Paris Saint-Germain",
+    "paris sg":"Paris Saint-Germain", "man utd":"Manchester United",
+    "man united":"Manchester United", "manchester utd":"Manchester United",
+    "inter":"Inter Milan", "internazionale":"Inter Milan",
+    "sporting lisbon":"Sporting CP", "sporting cp":"Sporting CP",
+    "atletico madrid":"Atletico Madrid", "ath madrid":"Atletico Madrid",
+    "bayern":"Bayern Munich", "bayern munich":"Bayern Munich",
+    "real madrid cf":"Real Madrid", "barca":"Barcelona", "fc barcelona":"Barcelona",
+    "juventus fc":"Juventus", "napoli fc":"Napoli", "ac milan":"AC Milan",
 }
 
 def norm(s):
-    s = unicodedata.normalize("NFKD", str(s)).encode("ascii","ignore").decode()
-    s = s.lower().replace("&","and")
-    s = re.sub(r"[^a-z0-9]+"," ",s).strip()
-    return s
+    s = "" if s is None else str(s)
+    s = unicodedata.normalize("NFKD", s).encode("ascii","ignore").decode()
+    s = s.lower().replace("&"," and ")
+    s = re.sub(r"[^a-z0-9]+"," ",s)
+    return re.sub(r"\s+"," ",s).strip()
 
-def alias(s):
+def canonical_input(s):
     n = norm(s)
     return norm(ALIASES.get(n, s))
 
-def db():
-    c=sqlite3.connect(DB_PATH)
-    c.execute("""CREATE TABLE IF NOT EXISTS matches(
-        date TEXT, home TEXT, away TEXT, gh INTEGER, ga INTEGER,
-        competition TEXT, level TEXT, source TEXT, PRIMARY KEY(date,home,away,gh,ga,source)
-    )""")
-    c.commit()
-    return c
+@st.cache_data(ttl=86400, show_spinner=False)
+def download_file(url, path):
+    if path.exists() and path.stat().st_size > 1000:
+        return str(path)
+    r = requests.get(url, timeout=60, headers={"User-Agent":"FootballAICoach/7"})
+    r.raise_for_status()
+    path.write_bytes(r.content)
+    return str(path)
 
-@st.cache_data(show_spinner=False)
-def download_bootstrap():
-    p=STATE/"games.parquet"
-    if not p.exists() or p.stat().st_size < 1000000:
-        r=requests.get(BOOTSTRAP_URL,timeout=90)
-        r.raise_for_status()
-        p.write_bytes(r.content)
-    return str(p)
+def load_raw():
+    download_file(FIXTURES_URL, DATA_FILE)
+    download_file(TEAMS_URL, TEAMS_FILE)
+    # match_stats/odds are optional; the model can operate from fixtures alone.
+    try: download_file(STATS_URL, STATS_FILE)
+    except Exception: pass
+    try: download_file(ODDS_URL, ODDS_FILE)
+    except Exception: pass
+    fx = pd.read_parquet(DATA_FILE)
+    teams = pd.read_parquet(TEAMS_FILE)
+    if STATS_FILE.exists():
+        stt = pd.read_parquet(STATS_FILE)
+        keep = [c for c in stt.columns if c in [
+            "fixture_id","home_goals_ht","away_goals_ht","home_xg","away_xg",
+            "home_xg_ht","away_xg_ht"
+        ]]
+        if "fixture_id" in keep:
+            fx = fx.merge(stt[keep].drop_duplicates("fixture_id"), left_on="id", right_on="fixture_id", how="left")
+    if ODDS_FILE.exists():
+        od = pd.read_parquet(ODDS_FILE)
+        keep = [c for c in od.columns if c in ["fixture_id","home_win","draw","away_win","bookmaker","source","known_at"]]
+        if "fixture_id" in keep:
+            od = od[keep].copy()
+            od = od.sort_values("known_at").drop_duplicates("fixture_id", keep="last") if "known_at" in od else od.drop_duplicates("fixture_id")
+            fx = fx.merge(od, left_on="id", right_on="fixture_id", how="left")
+    fx["date_utc"] = pd.to_datetime(fx["date_utc"], errors="coerce", utc=True)
+    fx = fx.sort_values("date_utc").reset_index(drop=True)
+    fx = fx[fx["home_team_id"].notna() & fx["away_team_id"].notna()].copy()
+    fx["home_team_id"] = fx["home_team_id"].astype(int)
+    fx["away_team_id"] = fx["away_team_id"].astype(int)
+    team_map = dict(zip(teams["id"].astype(int), teams["name"].astype(str)))
+    fx["home_name"] = fx["home_team_id"].map(team_map).fillna("Unknown")
+    fx["away_name"] = fx["away_team_id"].map(team_map).fillna("Unknown")
+    fx["played"] = fx["goals_home"].notna() & fx["goals_away"].notna()
+    return fx, teams
 
-def load_bootstrap():
-    p=download_bootstrap()
-    df=pd.read_parquet(p)
-    df=df.rename(columns={"gh":"home_goals","ga":"away_goals"})
-    df["date"]=pd.to_datetime(df["date"],errors="coerce")
-    df=df.dropna(subset=["date","home","away","home_goals","away_goals"]).copy()
-    df["home_goals"]=pd.to_numeric(df["home_goals"],errors="coerce")
-    df["away_goals"]=pd.to_numeric(df["away_goals"],errors="coerce")
-    df=df.dropna(subset=["home_goals","away_goals"])
-    df=df.sort_values("date").reset_index(drop=True)
-    return df
+def resolve_team(raw, teams):
+    q = canonical_input(raw)
+    exact = teams[teams["name"].map(norm) == q]
+    if len(exact) == 1:
+        r = exact.iloc[0]
+        return int(r["id"]), str(r["name"]), "exact"
+    # alias/canonical exact
+    aliases = teams.copy()
+    aliases["_n"] = aliases["name"].map(norm)
+    target = norm(ALIASES.get(q, q))
+    exact = aliases[aliases["_n"] == target]
+    if len(exact) == 1:
+        r = exact.iloc[0]
+        return int(r["id"]), str(r["name"]), "alias"
+    # safe token similarity, never substring-only
+    toks = set(target.split())
+    scores=[]
+    for _,r in aliases.iterrows():
+        rt=set(str(r["_n"]).split())
+        if not rt: continue
+        j=len(toks & rt)/max(1,len(toks|rt))
+        if j >= 0.75:
+            scores.append((j,int(r["id"]),str(r["name"])))
+    scores.sort(reverse=True)
+    if len(scores)==1 or (scores and (len(scores)==1 or scores[0][0]-scores[1][0] >= .12)):
+        return scores[0][1], scores[0][2], "safe-fuzzy"
+    return None, None, "ambiguous"
 
-def outcome(r):
-    if r.home_goals>r.away_goals: return 0
-    if r.home_goals==r.away_goals: return 1
-    return 2
+def init_team_state():
+    return {}
 
-def build_features(df, limit=300000):
-    """Chronological, leakage-safe feature construction."""
-    if len(df)>limit:
-        df=df.tail(limit).copy()
-    teams={}
-    elo={}
-    rows=[]; ys=[]
-    def st(t):
-        if t not in teams:
-            teams[t]={"n":0,"gf":[],"ga":[],"pts":[],"home":[],"away":[]}
-        return teams[t]
-    def e(t): return elo.get(t,1500.0)
-    for _,r in df.iterrows():
-        h=str(r.home); a=str(r.away)
-        hs,as_=st(h),st(a)
-        hgf=np.mean(hs["gf"][-10:]) if hs["gf"] else 1.2
-        hga=np.mean(hs["ga"][-10:]) if hs["ga"] else 1.2
-        agf=np.mean(as_["gf"][-10:]) if as_["gf"] else 1.0
-        aga=np.mean(as_["ga"][-10:]) if as_["ga"] else 1.3
-        hp=np.mean(hs["pts"][-5:]) if hs["pts"] else 1.0
-        ap=np.mean(as_["pts"][-5:]) if as_["pts"] else 1.0
-        hhome=np.mean(hs["home"][-8:]) if hs["home"] else 1.0
-        aaway=np.mean(as_["away"][-8:]) if as_["away"] else 1.0
-        x=[
-            e(h)-e(a), e(h)-1500, e(a)-1500,
-            hgf-hga, agf-aga, hgf, hga, agf, aga,
-            hp-ap, hhome-aaway,
-            min(hs["n"],20), min(as_["n"],20)
-        ]
-        if min(hs["n"],as_["n"])>=3:
-            rows.append(x); ys.append(outcome(r))
-        hg=float(r.home_goals); ag=float(r.away_goals)
-        hpts=3 if hg>ag else 1 if hg==ag else 0
-        apts=3 if ag>hg else 1 if hg==ag else 0
-        for t,go,con,pts,side in [(h,hg,ag,hpts,"home"),(a,ag,hg,apts,"away")]:
-            s=st(t); s["n"]+=1; s["gf"].append(go); s["ga"].append(con); s["pts"].append(pts)
-            s[side].append(pts)
-        # Elo update with margin-of-victory scaling.
-        diff=e(h)-e(a)+60
-        exp=1/(1+10**(-diff/400))
-        actual=1 if hg>ag else .5 if hg==ag else 0
-        margin=math.log1p(abs(hg-ag)+1)
-        k=18*margin
-        elo[h]=e(h)+k*(actual-exp)
-        elo[a]=e(a)+k*((1-actual)-(1-exp))
-    X=np.asarray(rows,dtype=float); y=np.asarray(ys)
-    return X,y,elo,teams
+def team_record(state, tid):
+    return state.setdefault(int(tid), {
+        "all":[], "home":[], "away":[], "elo":1500.0, "last_date":None
+    })
 
-def train_initial(df):
-    X,y,elo,teams=build_features(df)
-    split=max(1,int(len(X)*0.82))
-    Xtr,Xte=X[:split],X[split:]; ytr,yte=y[:split],y[split:]
-    model=HistGradientBoostingClassifier(
-        max_iter=260, learning_rate=.055, max_leaf_nodes=15,
-        l2_regularization=1.2, random_state=42
-    )
-    model.fit(Xtr,ytr)
-    p=model.predict_proba(Xte)
-    acc=accuracy_score(yte,model.predict(Xte))
-    ll=log_loss(yte,p,labels=[0,1,2])
-    # one-vs outcome Brier (multiclass mean)
-    bs=np.mean([brier_score_loss((yte==k).astype(int),p[:,k]) for k in range(3)])
-    joblib.dump(model,MODEL_DIR/"ft_hgb.joblib")
-    joblib.dump({"elo":elo,"teams":teams,"features":"v6","trained_rows":len(X),
-                 "train_rows":len(Xtr),"test_rows":len(Xte),
-                 "accuracy":acc,"log_loss":ll,"brier":bs,
-                 "trained_at":datetime.now(timezone.utc).isoformat()},
-                MODEL_DIR/"state.joblib")
-    return model, {"train":len(Xtr),"test":len(Xte),"accuracy":acc,"log_loss":ll,"brier":bs}
+def weighted_avg(vals, default=0.0):
+    if not vals: return default
+    vals=vals[-15:]
+    w=np.exp(np.linspace(-1.5,0,len(vals)))
+    return float(np.average(vals,weights=w))
 
-@st.cache_resource(show_spinner=False)
-def get_model():
-    df=load_bootstrap()
-    mpath=MODEL_DIR/"ft_hgb.joblib"
-    spath=MODEL_DIR/"state.joblib"
-    if mpath.exists() and spath.exists():
-        return joblib.load(mpath), joblib.load(spath), len(df), "persisted"
-    model,metrics=train_initial(df)
-    return model, joblib.load(spath), len(df), "bootstrapped"
+def features_for(state, h, a, date):
+    rh,ra=team_record(state,h),team_record(state,a)
+    def pts(seq):
+        return weighted_avg([x["pts"] for x in seq], 1.0)
+    def gf(seq): return weighted_avg([x["gf"] for x in seq], 1.0)
+    def ga(seq): return weighted_avg([x["ga"] for x in seq], 1.0)
+    hd = rh["elo"]-ra["elo"]
+    def rest(r):
+        if r["last_date"] is None: return 30.0
+        return max(0.0,(date-r["last_date"]).total_seconds()/86400)
+    hh = rh["home"][-15:]; aa=ra["away"][-15:]
+    h2h = []  # populated separately in training via global state if desired
+    vals = [
+        rh["elo"], ra["elo"], hd,
+        pts(rh["all"][-5:]), pts(ra["all"][-5:]),
+        pts(rh["all"][-10:]), pts(ra["all"][-10:]),
+        gf(rh["all"][-5:]), ga(rh["all"][-5:]),
+        gf(ra["all"][-5:]), ga(ra["all"][-5:]),
+        pts(hh[-5:]), pts(aa[-5:]),
+        gf(hh[-5:]), ga(hh[-5:]), gf(aa[-5:]), ga(aa[-5:]),
+        rest(rh), rest(ra)
+    ]
+    return np.array(vals,dtype=float)
 
-def team_lookup(df, q):
-    """Strict, alias-aware team resolver.
+FEATURE_NAMES = [
+    "home_elo","away_elo","elo_diff","home_form5","away_form5","home_form10","away_form10",
+    "home_gf5","home_ga5","away_gf5","away_ga5","home_home_form5","away_away_form5",
+    "home_home_gf5","home_home_ga5","away_away_gf5","away_away_ga5","home_rest","away_rest"
+]
 
-    The old resolver treated any substring as a strong match. That made
-    ``Paris Saint-Germain`` incorrectly match ``Aris`` because ``aris`` is
-    contained inside ``paris``. V6.1 only gives a strong score to an exact
-    normalized/alias match, and uses token/edit similarity only as a fallback.
-    Short one-token candidates are never accepted merely because they are a
-    substring of a longer team name.
-    """
-    from difflib import SequenceMatcher
-    qn=alias(q)
-    qtokens=set(qn.split())
-    names=pd.unique(pd.concat([df.home,df.away],ignore_index=True).astype(str))
-    scored=[]
-    for raw in names:
-        n=str(raw).strip()
-        nn=norm(n)
-        if not nn:
-            continue
-        # Strongest possible match: normalized name or known alias.
-        if nn==qn:
-            s=1.0
+def update_state(state,h,a,date,hg,ag):
+    rh,ra=team_record(state,h),team_record(state,a)
+    exp_h=1/(1+10**((ra["elo"]-rh["elo"]-55)/400))
+    result_h=1 if hg>ag else 0.5 if hg==ag else 0
+    margin=max(1,abs(hg-ag))
+    k=20*(1+math.log1p(margin))
+    rh["elo"] += k*(result_h-exp_h)
+    ra["elo"] += k*((1-result_h)-(1-exp_h))
+    hp=3 if hg>ag else 1 if hg==ag else 0
+    ap=3 if ag>hg else 1 if hg==ag else 0
+    rh["all"].append({"gf":hg,"ga":ag,"pts":hp}); rh["home"].append({"gf":hg,"ga":ag,"pts":hp})
+    ra["all"].append({"gf":ag,"ga":hg,"pts":ap}); ra["away"].append({"gf":ag,"ga":hg,"pts":ap})
+    rh["all"]=rh["all"][-30:]; ra["all"]=ra["all"][-30:]
+    rh["home"]=rh["home"][-30:]; ra["away"]=ra["away"][-30:]
+    rh["last_date"]=date; ra["last_date"]=date
+
+@st.cache_resource(show_spinner=True)
+def train_or_load(fx):
+    if MODEL_FILE.exists() and STATE_FILE.exists():
+        try:
+            bundle=joblib.load(MODEL_FILE)
+            return bundle
+        except Exception:
+            pass
+    played=fx[fx["played"]].copy()
+    # Need HT data for FH/SH. Rows without HT are excluded from those targets.
+    if "home_goals_ht" not in played.columns:
+        played["home_goals_ht"]=np.nan; played["away_goals_ht"]=np.nan
+    played["sh_home"]=played["goals_home"]-played["home_goals_ht"]
+    played["sh_away"]=played["goals_away"]-played["away_goals_ht"]
+    # Build chronological, leakage-safe features.
+    state=init_team_state()
+    X=[]; yft=[]; yfh=[]; ysh=[]; dates=[]
+    for r in played.itertuples(index=False):
+        d=r.date_utc
+        if pd.isna(d): continue
+        f=features_for(state,int(r.home_team_id),int(r.away_team_id),d)
+        if not np.all(np.isfinite(f)): f=np.nan_to_num(f,nan=0.0,posinf=0.0,neginf=0.0)
+        X.append(f); dates.append(d)
+        hg,ag=int(r.goals_home),int(r.goals_away)
+        yft.append(0 if hg>ag else 1 if hg==ag else 2)
+        if pd.notna(r.home_goals_ht) and pd.notna(r.away_goals_ht):
+            yfh.append((int(r.home_goals_ht),int(r.away_goals_ht)))
+            ysh.append((int(r.sh_home),int(r.sh_away)))
         else:
-            ntokens=set(nn.split())
-            inter=len(qtokens & ntokens)
-            union=len(qtokens | ntokens)
-            jacc=inter/max(1,union)
-            seq=SequenceMatcher(None,qn,nn).ratio()
-            # Only allow containment when it is a whole-token match and the
-            # candidate has at least two meaningful tokens.
-            token_contained = (len(ntokens)>=2 and (qn in nn or nn in qn))
-            if token_contained:
-                s=max(jacc, seq*0.96)
-            else:
-                s=max(jacc, seq*0.90)
-            # One-token names such as Aris must not score highly just because
-            # their letters occur inside a multi-token query.
-            if len(ntokens)==1 and len(qtokens)>=2 and nn not in qtokens:
-                s=min(s,0.55)
-        if s>=0.55:
-            scored.append((float(s),n))
-    # Deduplicate names by normalized spelling, keeping the strongest score.
-    best_by_norm={}
-    for s,n in scored:
-        k=norm(n)
-        if k not in best_by_norm or s>best_by_norm[k][0]:
-            best_by_norm[k]=(s,n)
-    out=list(best_by_norm.values())
-    out.sort(key=lambda x:(-x[0], x[1].lower()))
-    return out[:8]
-
-def make_feature_for_match(state,h,a):
-    teams=state["teams"]; elo=state["elo"]
-    def get(t):
-        return teams.get(t,{"n":0,"gf":[],"ga":[],"pts":[],"home":[],"away":[]})
-    hs,as_=get(h),get(a)
-    def avg(v,n,default): return float(np.mean(v[-n:])) if v else default
-    return np.array([[
-        elo.get(h,1500)-elo.get(a,1500), elo.get(h,1500)-1500, elo.get(a,1500)-1500,
-        avg(hs["gf"],10,1.2)-avg(hs["ga"],10,1.2),
-        avg(as_["gf"],10,1.0)-avg(as_["ga"],10,1.3),
-        avg(hs["gf"],10,1.2), avg(hs["ga"],10,1.2),
-        avg(as_["gf"],10,1.0), avg(as_["ga"],10,1.3),
-        avg(hs["pts"],5,1)-avg(as_["pts"],5,1),
-        avg(hs["home"],8,1)-avg(as_["away"],8,1),
-        min(hs["n"],20),min(as_["n"],20)
-    ]])
-
-def expected_goals(state,h,a):
-    teams=state["teams"]
-    hs=teams.get(h); as_=teams.get(a)
-    if not hs or not as_: return None
-    hgf=np.mean(hs["gf"][-10:]) if hs["gf"] else 1.3
-    hga=np.mean(hs["ga"][-10:]) if hs["ga"] else 1.1
-    agf=np.mean(as_["gf"][-10:]) if as_["gf"] else 1.1
-    aga=np.mean(as_["ga"][-10:]) if as_["ga"] else 1.3
-    # conservative blend of attack/defence, clipped for stability
-    eh=.58*hgf+.42*aga+.18
-    ea=.58*agf+.42*hga
-    return float(np.clip(eh,.15,4.2)),float(np.clip(ea,.15,4.2))
-
-def poisson_matrix(lh,la,n=8):
-    mat=np.outer(poisson.pmf(np.arange(n+1),lh),poisson.pmf(np.arange(n+1),la))
-    return mat/mat.sum()
-
-def markets(mat):
-    """Calculate a broad, deterministic market book from the score matrix."""
-    n = mat.shape[0]
-    entries = [(i, j, float(mat[i, j])) for i in range(n) for j in range(n)]
-
-    def prob(fn):
-        return float(sum(p for i, j, p in entries if fn(i, j)))
-
-    def total_gt(x):
-        return prob(lambda i, j: i + j > x)
-
-    def total_lt(x):
-        return prob(lambda i, j: i + j < x)
-
-    out = {
-        "Home Win": prob(lambda i,j: i > j),
-        "Draw": prob(lambda i,j: i == j),
-        "Away Win": prob(lambda i,j: i < j),
-        "1X": prob(lambda i,j: i >= j),
-        "X2": prob(lambda i,j: i <= j),
-        "12": prob(lambda i,j: i != j),
-
-        "Over 0.5": total_gt(0.5),
-        "Over 1.5": total_gt(1.5),
-        "Over 2.5": total_gt(2.5),
-        "Over 3.5": total_gt(3.5),
-        "Over 4.5": total_gt(4.5),
-
-        "Under 1.5": total_lt(1.5),
-        "Under 2.5": total_lt(2.5),
-        "Under 3.5": total_lt(3.5),
-        "Under 4.5": total_lt(4.5),
-
-        "BTTS Yes": prob(lambda i,j: i >= 1 and j >= 1),
-        "BTTS No": prob(lambda i,j: i == 0 or j == 0),
-
-        "Home Over 0.5": prob(lambda i,j: i >= 1),
-        "Home Over 1.5": prob(lambda i,j: i >= 2),
-        "Home Over 2.5": prob(lambda i,j: i >= 3),
-
-        "Away Over 0.5": prob(lambda i,j: j >= 1),
-        "Away Over 1.5": prob(lambda i,j: j >= 2),
-        "Away Over 2.5": prob(lambda i,j: j >= 3),
-
-        "Home Clean Sheet": prob(lambda i,j: j == 0),
-        "Away Clean Sheet": prob(lambda i,j: i == 0),
-        "Home Win To Nil": prob(lambda i,j: i > j and j == 0),
-        "Away Win To Nil": prob(lambda i,j: j > i and i == 0),
+            yfh.append((np.nan,np.nan)); ysh.append((np.nan,np.nan))
+        update_state(state,int(r.home_team_id),int(r.away_team_id),d,hg,ag)
+    X=np.asarray(X); yft=np.asarray(yft); dates=np.asarray(dates)
+    n=len(X); cut=int(n*.82)
+    # Cap training to keep Streamlit memory/time reasonable while preserving chronology.
+    max_train=260000
+    train_start=max(0,cut-max_train)
+    tr=np.arange(train_start,cut); te=np.arange(cut,n)
+    ft=HistGradientBoostingClassifier(max_iter=220,max_depth=7,learning_rate=.055,l2_regularization=1.5,random_state=42)
+    ft.fit(X[tr],yft[tr])
+    # FH/SH regressors use only rows with verified HT data.
+    fh=np.asarray(yfh,dtype=float); sh=np.asarray(ysh,dtype=float)
+    fhmask=np.isfinite(fh).all(axis=1); shmask=np.isfinite(sh).all(axis=1)
+    ftr=np.intersect1d(tr,np.where(fhmask)[0]); fte=np.intersect1d(te,np.where(fhmask)[0])
+    strr=np.intersect1d(tr,np.where(shmask)[0]); ste=np.intersect1d(te,np.where(shmask)[0])
+    fh_h=HistGradientBoostingRegressor(max_iter=180,max_depth=6,learning_rate=.06,l2_regularization=1.0,random_state=1)
+    fh_a=HistGradientBoostingRegressor(max_iter=180,max_depth=6,learning_rate=.06,l2_regularization=1.0,random_state=2)
+    sh_h=HistGradientBoostingRegressor(max_iter=180,max_depth=6,learning_rate=.06,l2_regularization=1.0,random_state=3)
+    sh_a=HistGradientBoostingRegressor(max_iter=180,max_depth=6,learning_rate=.06,l2_regularization=1.0,random_state=4)
+    if len(ftr)>=500:
+        fh_h.fit(X[ftr],fh[ftr,0]); fh_a.fit(X[ftr],fh[ftr,1])
+    if len(strr)>=500:
+        sh_h.fit(X[strr],sh[strr,0]); sh_a.fit(X[strr],sh[strr,1])
+    p=ft.predict_proba(X[te])
+    metrics={
+        "training_rows":int(len(tr)),"test_rows":int(len(te)),
+        "accuracy":float(accuracy_score(yft[te],np.argmax(p,axis=1))),
+        "log_loss":float(log_loss(yft[te],p,labels=[0,1,2])),
+        "brier":float(np.mean(np.sum((p-np.eye(3)[yft[te]])**2,axis=1))),
+        "fh_training_rows":int(len(ftr)),"sh_training_rows":int(len(strr)),
+        "trained_at":datetime.now(timezone.utc).isoformat(),
     }
-    # Keep numerical safety after the finite 0..8 score grid.
-    return {k: float(np.clip(v, 0.0, 1.0)) for k,v in out.items()}
+    bundle={"ft":ft,"fh_h":fh_h,"fh_a":fh_a,"sh_h":sh_h,"sh_a":sh_a,
+            "feature_names":FEATURE_NAMES,"metrics":metrics,"state":state}
+    joblib.dump(bundle,MODEL_FILE,compress=3)
+    STATE_FILE.write_text(json.dumps(metrics))
+    return bundle
 
-def exact_fixture_web(home,away,date=None):
-    # No API: use public search engine HTML through a search endpoint.
-    # We only confirm when both names and, if supplied, the date are present.
-    q=f'"{home}" "{away}" football'
-    if date: q+=f' "{date}"'
+def score_matrix(lh,la,maxg=8):
+    ps=np.outer(poisson.pmf(np.arange(maxg+1),max(1e-6,lh)),
+                poisson.pmf(np.arange(maxg+1),max(1e-6,la)))
+    return ps/ps.sum()
+
+def one_x_two(mat):
+    h=np.tril(mat,-1).sum() # row home goals > away? Need correct:
+    h=sum(mat[i,j] for i in range(mat.shape[0]) for j in range(mat.shape[1]) if i>j)
+    d=sum(mat[i,j] for i in range(mat.shape[0]) for j in range(mat.shape[1]) if i==j)
+    a=sum(mat[i,j] for i in range(mat.shape[0]) for j in range(mat.shape[1]) if i<j)
+    return np.array([h,d,a])
+
+def market_book(mat, fh_mat=None, sh_mat=None):
+    def P(fn):
+        return float(sum(mat[i,j] for i in range(mat.shape[0]) for j in range(mat.shape[1]) if fn(i,j)))
+    out={
+        "1":P(lambda i,j:i>j),"X":P(lambda i,j:i==j),"2":P(lambda i,j:i<j),
+        "1X":P(lambda i,j:i>=j),"X2":P(lambda i,j:i<=j),"12":P(lambda i,j:i!=j),
+        "Over 0.5":P(lambda i,j:i+j>0.5),"Over 1.5":P(lambda i,j:i+j>1.5),
+        "Over 2.5":P(lambda i,j:i+j>2.5),"Over 3.5":P(lambda i,j:i+j>3.5),
+        "Over 4.5":P(lambda i,j:i+j>4.5),
+        "Under 1.5":P(lambda i,j:i+j<1.5),"Under 2.5":P(lambda i,j:i+j<2.5),
+        "Under 3.5":P(lambda i,j:i+j<3.5),"Under 4.5":P(lambda i,j:i+j<4.5),
+        "BTTS Yes":P(lambda i,j:i>=1 and j>=1),"BTTS No":P(lambda i,j:i==0 or j==0),
+        "Home O0.5":P(lambda i,j:i>=1),"Home O1.5":P(lambda i,j:i>=2),"Home O2.5":P(lambda i,j:i>=3),
+        "Away O0.5":P(lambda i,j:j>=1),"Away O1.5":P(lambda i,j:j>=2),"Away O2.5":P(lambda i,j:j>=3),
+        "Home CS":P(lambda i,j:j==0),"Away CS":P(lambda i,j:i==0),
+        "Home Win to Nil":P(lambda i,j:i>j and j==0),"Away Win to Nil":P(lambda i,j:j>i and i==0)
+    }
+    return {k:max(0,min(1,v)) for k,v in out.items()}
+
+def compatible_ft(fh, sh):
+    # Convolution of FH and SH score matrices.
+    out=np.zeros((9,9))
+    for i in range(fh.shape[0]):
+        for j in range(fh.shape[1]):
+            for k in range(sh.shape[0]):
+                for l in range(sh.shape[1]):
+                    if i+k<9 and j+l<9:
+                        out[i+k,j+l]+=fh[i,j]*sh[k,l]
+    return out/out.sum()
+
+def best_scores(mat, n=10):
+    vals=[]
+    for i in range(mat.shape[0]):
+        for j in range(mat.shape[1]):
+            vals.append((float(mat[i,j]),i,j))
+    return sorted(vals,reverse=True)[:n]
+
+def current_team_stats(fx,tid, before_date):
+    x=fx[(fx["played"]) & (fx["date_utc"]<before_date) & ((fx.home_team_id==tid)|(fx.away_team_id==tid))].tail(30)
+    if x.empty: return {}
+    return {"matches":len(x)}
+
+def live_odds_search(home,away,date_text):
+    # No bookmaker odds are invented. Public web search is best-effort only.
+    # Search engines often block automation; failure is reported as unavailable.
     try:
-        r=requests.get("https://www.google.com/search",params={"q":q},
-                       headers={"User-Agent":"Mozilla/5.0"},timeout=12)
-        text=re.sub(r"<[^>]+>"," ",r.text)
-        t=norm(text)
-        ok=norm(home) in t and norm(away) in t
-        if date: ok = ok and str(date) in text
-        return ok
+        q=f"{home} vs {away} odds {date_text}".replace(" ","+")
+        url="https://www.google.com/search?q="+q
+        r=requests.get(url,timeout=8,headers={"User-Agent":"Mozilla/5.0"})
+        if r.status_code!=200: return None
+        text=r.text
+        # Conservative parser: only accept explicit decimal pairs in snippets.
+        vals=re.findall(r'(?<![\d.])([1-9]\d?(?:\.\d{1,2})?)(?![\d.])',text)
+        nums=[float(v) for v in vals if 1.01<=float(v)<=50]
+        if len(nums)>=3:
+            return {"home":nums[0],"draw":nums[1],"away":nums[2],"source":"public web search (unverified)"}
     except Exception:
-        return False
+        pass
+    return None
 
-st.set_page_config(page_title=APP,page_icon="⚽",layout="wide")
+st.set_page_config(page_title=APP,layout="wide")
 st.title(APP)
-st.caption("Real ML • persistent pre-trained model • strict team resolver • continual-learning ready • no football API")
+st.caption("Real ML • FH/SH/FT • Poisson • Elo/Form • persistent model • no football API")
 
 with st.sidebar:
-    st.header("MATCH")
-    home=st.text_input("HOME TEAM","Paris Saint-Germain")
-    away=st.text_input("AWAY TEAM","Lens")
-    date=st.text_input("MATCH DATE (optional)","")
+    st.subheader("MATCH")
+    home_raw=st.text_input("HOME TEAM","Paris Saint-Germain")
+    away_raw=st.text_input("AWAY TEAM","Lens")
+    date_raw=st.text_input("MATCH DATE (optional)","")
+    st.divider()
     refresh=st.button("Refresh public dataset")
-    st.info("No football API key is required. The initial model is trained once from a real historical open dataset and then persisted.")
     if refresh:
-        for p in [STATE/"games.parquet",MODEL_DIR/"ft_hgb.joblib",MODEL_DIR/"state.joblib"]:
-            if p.exists(): p.unlink()
+        for p in [DATA_FILE,STATS_FILE,ODDS_FILE,TEAMS_FILE,MODEL_FILE,STATE_FILE]:
+            try:p.unlink()
+            except:pass
         st.cache_data.clear(); st.cache_resource.clear()
         st.rerun()
 
 try:
-    with st.spinner("Loading persistent football model..."):
-        model,state,nrows,mode=get_model()
-    st.success(f"MODEL READY • {mode.upper()} • historical rows available: {nrows:,}")
-    st.caption("Historical rows = source dataset size. The trained model reports its actual training/test rows below.")
+    fx,teams=load_raw()
 except Exception as e:
-    st.error("MODEL BOOTSTRAP FAILED")
-    st.exception(e)
+    st.error("DATA LOAD FAILED")
+    st.exception(e); st.stop()
+
+bundle=train_or_load(fx)
+m=bundle["metrics"]
+st.success(f"MODEL READY • persisted • historical fixtures loaded: {len(fx):,}")
+c1,c2,c3,c4=st.columns(4)
+c1.metric("Training rows",f"{m['training_rows']:,}")
+c2.metric("Test rows",f"{m['test_rows']:,}")
+c3.metric("Accuracy",f"{m['accuracy']*100:.2f}%")
+c4.metric("Log Loss",f"{m['log_loss']:.4f}")
+
+hid,hname,hmode=resolve_team(home_raw,teams)
+aid,aname,amode=resolve_team(away_raw,teams)
+if not hid or not aid or hid==aid:
+    st.error("TEAMS NOT SAFELY RESOLVED")
+    st.write("Home:",hmode,"• Away:",amode)
     st.stop()
+st.success(f"TEAMS CONFIRMED • {hname} vs {aname}")
 
-st.write(f"### {home}  vs  {away}")
-st.caption("Team matching uses exact normalized names and explicit aliases first; weak substring matches are rejected.")
-hcan=team_lookup(load_bootstrap(),home)
-acan=team_lookup(load_bootstrap(),away)
-if not hcan or not acan:
-    st.error("TEAM NOT FOUND IN TRAINING KNOWLEDGE BASE")
-    st.stop()
-
-# Strictly confirm only if top candidate is clearly separated.
-if hcan[0][0] < .78 or (len(hcan)>1 and hcan[0][0]-hcan[1][0]<.08):
-    st.warning("HOME TEAM AMBIGUOUS")
-    st.dataframe(pd.DataFrame(hcan,columns=["score","team"]))
-    st.stop()
-if acan[0][0] < .78 or (len(acan)>1 and acan[0][0]-acan[1][0]<.08):
-    st.warning("AWAY TEAM AMBIGUOUS")
-    st.dataframe(pd.DataFrame(acan,columns=["score","team"]))
-    st.stop()
-
-H,A=hcan[0][1],acan[0][1]
-st.success(f"TEAMS CONFIRMED • {H} vs {A}")
-
-if date:
-    try: d=pd.to_datetime(date).date().isoformat()
-    except: d=date
-else: d=None
-
-fixture_ok=exact_fixture_web(H,A,d)
-if not fixture_ok:
-    st.warning("EXACT FIXTURE NOT VERIFIED ON PUBLIC WEB — prediction is model-only and no fixture data is invented.")
+# Determine a prediction date; use supplied date or next relevant calendar date.
+if date_raw:
+    try: target_date=pd.Timestamp(date_raw,tz="UTC")
+    except: target_date=pd.Timestamp.now(tz="UTC")
 else:
-    st.success("EXACT FIXTURE VERIFIED ON PUBLIC WEB")
+    target_date=pd.Timestamp.now(tz="UTC")
 
-X=make_feature_for_match(state,H,A)
-p_ml=model.predict_proba(X)[0]
-eg=expected_goals(state,H,A)
-if eg is None:
-    st.error("DATA NOT AVAILABLE FOR THIS MATCH")
-    st.stop()
-lh,la=eg
-mat=poisson_matrix(lh,la,8)
-pm=markets(mat)
+# Reconstruct current state by replaying all played matches before target.
+state=init_team_state()
+hist=fx[(fx.played)&(fx.date_utc<target_date)].sort_values("date_utc")
+for r in hist.itertuples(index=False):
+    update_state(state,int(r.home_team_id),int(r.away_team_id),r.date_utc,int(r.goals_home),int(r.goals_away))
+feat=features_for(state,hid,aid,target_date).reshape(1,-1)
+feat=np.nan_to_num(feat,nan=0,posinf=0,neginf=0)
 
-# Ensemble: ML 1X2 + Poisson, with transparent equal weights.
-p_po=np.array([pm["Home Win"],pm["Draw"],pm["Away Win"]])
-p_final=.55*p_ml+.45*p_po
-p_final=p_final/p_final.sum()
+p_ft_ml=bundle["ft"].predict_proba(feat)[0]
+# Model-derived expected goals; regressors are independently trained on real HT/SH targets.
+fh_h=float(max(0,bundle["fh_h"].predict(feat)[0]))
+fh_a=float(max(0,bundle["fh_a"].predict(feat)[0]))
+sh_h=float(max(0,bundle["sh_h"].predict(feat)[0]))
+sh_a=float(max(0,bundle["sh_a"].predict(feat)[0]))
+ft_h,ft_a=fh_h+sh_h,fh_a+sh_a
 
-top_scores=sorted(((i,j), float(mat[i,j])) for i in range(mat.shape[0]) for j in range(mat.shape[1]))[::-1]
-best=[]
-for name,p in pm.items():
-    p=float(p)
-    if not np.isfinite(p) or p <= 0.0:
-        continue
-    fair=1.0/p
-    # Without bookmaker odds, this is a model-probability ranking only.
-    # We penalize extremely low-probability markets rather than pretending
-    # they have positive betting value.
-    score = p * math.sqrt(max(0.0, min(1.0, p)))
-    best.append((name,p,fair,score))
-best=sorted(best,key=lambda x:x[3],reverse=True)
+fh_mat=score_matrix(fh_h,fh_a)
+sh_mat=score_matrix(sh_h,sh_a)
+ft_compat=compatible_ft(fh_mat,sh_mat)
+p_ft_poi=one_x_two(ft_compat)
+p_ft=(0.60*p_ft_ml+0.40*p_ft_poi); p_ft=p_ft/p_ft.sum()
+
+st.header("FIRST HALF")
+st.write(f"Expected goals: **{fh_h:.2f} — {fh_a:.2f}**")
+fh1=one_x_two(fh_mat)
+fc1,fcd,fca=st.columns(3); fc1.metric("Home",f"{fh1[0]*100:.1f}%"); fcd.metric("Draw",f"{fh1[1]*100:.1f}%"); fca.metric("Away",f"{fh1[2]*100:.1f}%")
+fs=best_scores(fh_mat,1)[0]
+st.write(f"Most likely FH score: **{fs[1]}–{fs[2]} ({fs[0]*100:.1f}%)**")
+
+st.header("SECOND HALF")
+st.write(f"Expected goals: **{sh_h:.2f} — {sh_a:.2f}**")
+sh1=one_x_two(sh_mat)
+sc1,scd,sca=st.columns(3); sc1.metric("Home",f"{sh1[0]*100:.1f}%"); scd.metric("Draw",f"{sh1[1]*100:.1f}%"); sca.metric("Away",f"{sh1[2]*100:.1f}%")
+ss=best_scores(sh_mat,1)[0]
+st.write(f"Most likely SH score: **{ss[1]}–{ss[2]} ({ss[0]*100:.1f}%)**")
 
 st.header("FULL TIME")
-c1,c2,c3=st.columns(3)
-c1.metric("Home",f"{p_final[0]*100:.1f}%")
-c2.metric("Draw",f"{p_final[1]*100:.1f}%")
-c3.metric("Away",f"{p_final[2]*100:.1f}%")
-st.write(f"**Expected goals:** {lh:.2f} — {la:.2f}")
-with st.expander("MODEL vs POISSON PROBABILITIES"):
-    diag = pd.DataFrame({
-        "Outcome":["Home","Draw","Away"],
-        "ML":[f"{x*100:.2f}%" for x in p_ml],
-        "Poisson":[f"{x*100:.2f}%" for x in p_po],
-        "Ensemble":[f"{x*100:.2f}%" for x in p_final],
-    })
-    st.dataframe(diag, use_container_width=True)
-
+st.write(f"Expected goals: **{ft_h:.2f} — {ft_a:.2f}**")
+fc1,fcd,fca=st.columns(3); fc1.metric("Home",f"{p_ft[0]*100:.1f}%"); fcd.metric("Draw",f"{p_ft[1]*100:.1f}%"); fca.metric("Away",f"{p_ft[2]*100:.1f}%")
+fs=best_scores(ft_compat,1)[0]
+st.success(f"MOST LIKELY FINAL SCORE: {fs[1]}–{fs[2]} • {fs[0]*100:.1f}%")
 
 st.header("TOP 10 SCORES")
-rows=[]
-for (i,j),pr in top_scores[:10]:
-    rows.append({"Score":f"{i}-{j}","Probability":pr,"Fair odds":1/pr})
+rows=[{"Rank":i+1,"Score":f"{h}–{a}","Probability":f"{p*100:.2f}%","Fair Odds":f"{1/p:.2f}"} for i,(p,h,a) in enumerate(best_scores(ft_compat,10))]
 st.dataframe(pd.DataFrame(rows),use_container_width=True)
 
 st.header("MARKETS")
-mr=[]
-for name,p in pm.items():
-    mr.append({"Market":name,"Probability":f"{p*100:.1f}%","Fair Odds":f"{1/p:.2f}"})
-st.dataframe(pd.DataFrame(mr),use_container_width=True)
+pm=market_book(ft_compat)
+mk=pd.DataFrame([{"Market":k,"Probability":f"{v*100:.1f}%","Fair Odds":f"{1/v:.2f}"} for k,v in sorted(pm.items(),key=lambda z:z[1],reverse=True)])
+st.dataframe(mk,use_container_width=True)
 
-st.header("BEST MODEL BETS")
-st.caption("These are model selections only. Without verified bookmaker odds there is NO real bookmaker value/edge calculation.")
-bb=[]
-for name,p,fair,score in best[:3]:
-    confidence=(0.5+0.5*max(p_final))*(0.7+0.3*min(1,nrows/200000))
-    bb.append({"Rank":len(bb)+1,"Market":name,"Probability":f"{p*100:.1f}%",
-               "Fair Odds":f"{fair:.2f}","Bookmaker Odds":"NOT AVAILABLE",
-               "Value/Edge":"NOT CALCULABLE",
-               "Confidence":f"{confidence*100:.1f}%"})
-st.dataframe(pd.DataFrame(bb),use_container_width=True)
+st.header("BEST BET")
+# Rank diversified markets by model probability; no value claim without current bookmaker odds.
+families={
+"1":"1X2","X":"1X2","2":"1X2","1X":"Double Chance","X2":"Double Chance","12":"Double Chance",
+"Over 0.5":"Goals","Over 1.5":"Goals","Over 2.5":"Goals","Over 3.5":"Goals","Over 4.5":"Goals",
+"Under 1.5":"Goals","Under 2.5":"Goals","Under 3.5":"Goals","Under 4.5":"Goals",
+"BTTS Yes":"BTTS","BTTS No":"BTTS","Home O0.5":"Team Goals","Home O1.5":"Team Goals","Home O2.5":"Team Goals",
+"Away O0.5":"Team Goals","Away O1.5":"Team Goals","Away O2.5":"Team Goals",
+"Home CS":"Clean Sheet","Away CS":"Clean Sheet","Home Win to Nil":"Win to Nil","Away Win to Nil":"Win to Nil"}
+chosen=[]; used=set()
+for name,p in sorted(pm.items(),key=lambda z:z[1],reverse=True):
+    fam=families.get(name,name)
+    if fam in used: continue
+    used.add(fam); chosen.append((name,p))
+    if len(chosen)>=3: break
+best_rows=[]
+for rank,(name,p) in enumerate(chosen,1):
+    best_rows.append({"Rank":rank,"Market":name,"Model Probability":f"{p*100:.1f}%","Fair Odds":f"{1/p:.2f}","Bookmaker Odds":"NOT AVAILABLE","Value":"NOT CALCULABLE"})
+st.dataframe(pd.DataFrame(best_rows),use_container_width=True)
+st.info("BEST BET هنا هو أفضل اختيار حسب احتمال النموذج فقط. لا توجد قيمة مالية مؤكدة بدون سعر bookmaker حقيقي. لا يتم اختراع Odds.")
 
-st.header("FIRST HALF / SECOND HALF")
-st.info("The bootstrap dataset used for the persistent ML model contains full-time results. It does not contain reliable first-half scores for all competitions, so FH/SH are NOT fabricated. They become available only after a verified source supplies real half-time data.")
+# Try a conservative public-web odds lookup only after model output.
+if st.button("Try public-web odds lookup"):
+    odds=live_odds_search(hname,aname,date_raw or "upcoming")
+    if odds:
+        st.warning("تم العثور على أرقام محتملة من بحث الويب، لكنها غير موثقة كمصدر bookmaker؛ لذلك لا تدخل في حساب Value.")
+        st.json(odds)
+    else:
+        st.info("BOOKMAKER ODDS NOT FOUND FROM PUBLIC WEB")
 
 st.header("MODEL HEALTH")
-meta=state
-st.write({
-    "trained_at":meta.get("trained_at"),
-    "training_rows":meta.get("train_rows"),
-    "test_rows":meta.get("test_rows"),
-    "accuracy":round(meta.get("accuracy",0),4),
-    "log_loss":round(meta.get("log_loss",0),4),
-    "brier":round(meta.get("brier",0),4),
-    "model_type":"HistGradientBoostingClassifier",
-    "feature_count":13,
-    "persistent_model":True
-})
-st.caption("The trained model is persisted in the app filesystem and loaded on later runs while that storage remains available. V6.3 does not claim completed automatic online learning until new labeled-match ingestion is connected.")
+st.json({**m,"model_type":"HistGradientBoostingClassifier + 4 HistGradientBoostingRegressors","persistent_model":MODEL_FILE.exists(),
+         "feature_count":len(FEATURE_NAMES),"continual_learning":"incremental result ingestion module not yet auto-connected to live web results"})
+
+st.caption("المصدر الأولي للـbootstrap هو dataset عام CC-BY يحتوي على HT/FT وOdds. هذا الإصدار لا يستخدم football-data.org أو API-Football مباشرة. بيانات Odds التاريخية ليست Odds حية للمباراة الحالية.")

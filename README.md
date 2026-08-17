@@ -1,24 +1,38 @@
-# Football AI Coach V6.3
+# Football AI Coach V7 — Complete Prediction Engine
 
-Real ML football prediction application.
+## What this version actually does
 
-## What is real
-- 1.3M+ historical rows in the bootstrap source dataset.
-- Chronological, leakage-safe feature construction.
-- HistGradientBoostingClassifier.
-- Time-based train/test split.
-- Accuracy, log loss and multiclass Brier score.
-- Persisted trained model.
-- Elo/form/goal features.
-- Poisson score matrix.
-- ML + Poisson ensemble.
-- Broad model-derived markets and fair odds.
+This is a real ML application, not an if/else demo.
 
-## Important limitations
-- The bootstrap dataset contains final scores, not reliable first-half scores for every competition. FH/SH are therefore not fabricated.
-- Bookmaker odds are not invented. Without a verified odds source, bookmaker value/edge is not calculated.
-- Public-web fixture verification is only a safety check; failure to verify does not create a fake fixture.
-- V6.3 does NOT falsely claim that automatic online learning is already implemented. The persisted model can be loaded without retraining, but a production continual-learning ingestion pipeline still needs to be connected to verified new match results.
+It trains and persists:
+- Full-time 1X2 HistGradientBoostingClassifier
+- First-half home/away goal regressors
+- Second-half home/away goal regressors
+- Elo replay
+- Weighted Form (5/10/15, overall/home/away)
+- Poisson score matrices
+- mathematically compatible FT score distribution from FH + SH
+- 1X2, double chance, totals, BTTS, team-goals, clean-sheet and win-to-nil markets
+- fair odds
+- model-only best picks
+- time-based train/test evaluation
+
+## Important source disclosure
+
+The bootstrap dataset used here is a public CC-BY dataset on Hugging Face containing 673,966 fixtures and real half-time/full-time fields plus historical odds. Its own metadata states that its upstream sources include API-Football and football-data.co.uk.
+
+Therefore V7 does NOT call those services as APIs, but it also cannot honestly be described as a dataset with those upstream sources excluded.
+
+If your strict requirement is "no API-Football and no football-data.co.uk even as upstream data", replace the bootstrap source with a dataset whose provenance meets that requirement and preserves reliable HT/FT/odds fields.
+
+## No invented odds
+
+Current bookmaker odds are not fabricated. Historical odds in the training data are not presented as current odds. If current public-web odds cannot be verified, the app shows `NOT AVAILABLE` and does not calculate value.
+
+## Continual learning
+
+The trained model is persisted locally and loaded on later runs. A complete live continual-learning loop requires a verified feed of newly finished matches. V7 does not pretend that scraping arbitrary pages is a reliable label feed.
 
 ## Deploy
-Replace `app.py`, `requirements.txt`, and `README.md` in the GitHub repository, commit, then reboot the Streamlit app.
+
+Upload `app.py` and `requirements.txt` to GitHub and deploy `app.py` on Streamlit Community Cloud.
