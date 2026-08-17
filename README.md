@@ -1,8 +1,8 @@
-# Football AI Coach V6.1 — Real ML
+# Football AI Coach V6.2 — Real ML
 
-V6.1 fixes a critical team-resolution bug from V6. The previous resolver treated any substring as a strong match, so `Paris Saint-Germain` could incorrectly match `Aris`.
+V6.2 fixes a critical team-resolution bug from V6. The previous resolver treated any substring as a strong match, so `Paris Saint-Germain` could incorrectly match `Aris`.
 
-## What V6.1 does
+## What V6.2 does
 - Real `HistGradientBoostingClassifier` trained on chronological football results.
 - Bootstrap dataset: real historical match results from the documented open dataset.
 - Persistent `joblib` model and state.
@@ -20,3 +20,7 @@ V6.1 fixes a critical team-resolution bug from V6. The previous resolver treated
 The bootstrap dataset currently contains full-time results, not reliable first-half/second-half scores for every competition. Therefore FH/SH predictions are not fabricated.
 
 Continual learning requires new labeled matches to be appended to the persistent knowledge base and then applied to the saved model; the app does not silently retrain from scratch for each prediction.
+
+
+## V6.2 bug fix
+Fixed the TOP 10 SCORES crash: the previous version accidentally iterated over the market dictionary (`Home Win`, `Draw`, etc.) as if it were a score matrix. V6.2 now reads score probabilities directly from the Poisson matrix.

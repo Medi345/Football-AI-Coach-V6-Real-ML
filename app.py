@@ -14,7 +14,7 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.pipeline import make_pipeline
 import joblib
 
-APP = "⚽ Football AI Coach V6.1"
+APP = "⚽ Football AI Coach V6.2"
 BASE = Path(".")
 STATE = BASE / "coach_state"
 STATE.mkdir(exist_ok=True)
@@ -373,7 +373,7 @@ p_po=np.array([pm["Home Win"],pm["Draw"],pm["Away Win"]])
 p_final=.55*p_ml+.45*p_po
 p_final=p_final/p_final.sum()
 
-top_scores=sorted(pm.items(),key=lambda x:x[1],reverse=True)
+top_scores=sorted(((i,j), float(mat[i,j])) for i in range(mat.shape[0]) for j in range(mat.shape[1]))[::-1]
 best=[]
 for name,p in pm.items():
     if p<=0: continue
